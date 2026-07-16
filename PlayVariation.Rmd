@@ -1,0 +1,701 @@
+---
+title: "Keeping Defenses Guessing"
+subtitle: "Does Unpredictable Play-Calling Improve NFL Offenses?"
+author: "Kyle Smith"
+date: "2024 (Revised July 2026)"
+output: 
+  pdf_document:
+    toc: true
+    toc_depth: 1
+    number_sections: false
+    fig_caption: true
+    latex_engine: xelatex
+geometry: margin=1in
+fontsize: 11pt
+header-includes:
+  - \usepackage{etoolbox}
+  - \usepackage{float}
+  - \usepackage{titling}
+  - \usepackage{tocloft}
+  - \pretitle{\begin{center}\vspace*{\fill}\LARGE\bfseries}
+  - \posttitle{\end{center}}
+  - \preauthor{\begin{center}\large}
+  - \postauthor{\end{center}}
+  - \predate{\begin{center}\large}
+  - \postdate{\end{center}\vspace*{\fill}}
+  - \appto\maketitle\thispagestyle{empty}{\newpage}
+  - \renewcommand{\cfttoctitlefont}{\hfill\Large\bfseries}
+  - \renewcommand{\cftaftertoctitle}{\hfill}
+  - \pretocmd{\tableofcontents}{\thispagestyle{empty}\vspace*{\fill}}{}{}
+  - \apptocmd{\tableofcontents}{\vspace*{\fill}}{}{}
+  - \setlength{\textfloatsep}{5pt}
+  - \setlength{\intextsep}{5pt}
+  - \setlength{\abovecaptionskip}{3pt}
+  - \setlength{\belowcaptionskip}{3pt}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  echo = F,
+  warning = F,
+  message = F,
+  fig.align = "center",
+  fig.width = 6,
+  fig.height = 2.5,
+  fig.pos = "H"
+)
+```
+
+\newpage
+
+# Introduction
+
+In the modern landscape of the National Football League, the evolution of play calling schemes has become a critical factor of a team's offensive success. Every week of the season, offensive play callers attempt to out-think the coaches on the opposite sideline. This study moves to analyze the factors of play calling that create successful plays, specifically variation. How much, if at all, should a team change up their play calling to best set their team up for success? In this study, the relationship between play calling strategies and their success are tested using a combination of statistical analysis, situational data, and efficiency metrics. 
+
+In order to discover how successful drives are called, this study proceeds as if variation in playcalling plays no role in a drive's success until sufficient statistical evidence is presented to reject that hypothesis.
+
+```{r drives-table, cache = TRUE}
+library(tidyverse); library(nflverse); library(entropy); library(dplyr)
+
+pv_data <- load_pbp(seasons = 2015:2025) %>%
+  filter(!startsWith(game_id, "2020_"),
+         play_type %in% c("run", "pass"),
+         !is.na(epa), !is.na(posteam), !is.na(drive),
+         qb_kneel == 0, qb_spike == 0, two_point_attempt == 0) %>%
+  mutate(
+    season = as.integer(substr(game_id, 1, 4)),
+    passer_player_name = gsub("\\.", ". ", passer_player_name),
+    posteam = ifelse(posteam == "LV", "LVR", 
+                     ifelse(posteam == "LA", "LAR", posteam))
+  ) %>%
+  dplyr::select(
+    game_id, season, week, posteam, defteam, drive, play_id, play_type,
+    down, ydstogo, yardline_100, epa, pass_location, air_yards, 
+    run_location, run_gap, score_differential, half_seconds_remaining,
+    wp, roof, temp, wind, passer_player_name, passer_player_id, receiver_player_id, touchdown,
+    first_down, success
+  )
+
+#2020 eliminated initially due to opt outs, no fans, a generally abnormal year. May be included back in later for robustness or general testing.
+#temp, wind, bad weather don't meaningfully differ between drives, so they are game level variables.
+
+qbz <- pv_data %>%
+  filter(play_type == "pass", !is.na(passer_player_id)) %>%
+  group_by(season, passer_player_id, passer_player_name) %>%
+  summarize(qb_epa = mean(epa, na.rm = T), .groups = "drop") %>%
+  group_by(season) %>%
+  mutate(qbz = scale(qb_epa)[, 1]) %>%
+  ungroup() %>%
+  dplyr::select(season, passer_player_id, passer_player_name, qbz)
+
+rbz <- pv_data %>%
+  filter(play_type == "run") %>%
+  group_by(season, posteam) %>%
+  summarize(rush_epa = mean(epa, na.rm = T), .groups = "drop") %>%
+  group_by(season) %>%
+  mutate(rbz = scale(rush_epa)[, 1]) %>%
+  ungroup() %>%
+  dplyr::select(season, posteam, rbz)
+
+wrz <- pv_data %>%
+  filter(play_type == "pass", !is.na(receiver_player_id)) %>%
+  group_by(season, posteam, receiver_player_id) %>%
+  summarize(
+    rec_epa = mean(epa, na.rm = T),
+    targets = n(),
+    .groups = "drop"
+  ) %>%
+  group_by(season, posteam) %>%
+  summarize(
+    wrz_raw = weighted.mean(rec_epa, w = targets, na.rm = T),
+    .groups = "drop"
+  ) %>%
+  group_by(season) %>%
+  mutate(wrz = scale(wrz_raw)[, 1]) %>%
+  ungroup() %>%
+  dplyr::select(season, posteam, wrz)
+
+defz <- pv_data %>%
+  group_by(season, defteam) %>%
+  summarize(def_epa = mean(epa, na.rm = T), .groups = "drop") %>%
+  group_by(season) %>%
+  mutate(defz = -scale(def_epa)[, 1]) %>% #higher values = better defenses
+  ungroup() %>%
+  dplyr::select(season, defteam, defz)
+
+
+library(readxl)
+
+blocking_grades <- read_xlsx("blocking_grades.xlsx") %>%
+  pivot_longer(
+    cols = -team,
+    names_to = c(".value", "season"),
+    names_pattern = "(rblk|pblk)_(\\d{4})"
+  ) %>%
+  mutate(season = as.integer(season)) %>%
+  filter(season != 2020) %>%
+  rename(rblk_grade = rblk, pblk_grade = pblk) %>%
+  group_by(season) %>%
+  mutate(rblk_grade = scale(rblk_grade)[, 1], pblk_grade = scale(pblk_grade)[, 1])
+
+std_entropy <- function(x){
+  tbl <- table(x)
+  if(length(tbl) <= 1) return(0)
+  H <- entropy(tbl, unit = "log2")
+  H_max <- log2(length(tbl))
+  H / H_max
+}
+
+drives <- pv_data %>%
+  group_by(game_id, season, week, posteam, defteam, drive) %>%
+  arrange(play_id, .by_group = T) %>%
+  summarize(
+    epa_per_play = mean(epa, na.rm = T),
+    nplays = n(),
+    npass = sum(play_type == "pass"),
+    nrun = sum(play_type == "run"),
+    pass_rate = npass / nplays,
+    play_category = list({
+      category <- case_when(
+          play_type == "pass" & air_yards <= 7 & pass_location == "left" ~ "pass_short_left",
+          play_type == "pass" & air_yards <= 7 & pass_location == "middle" ~ "pass_short_middle",
+          play_type == "pass" & air_yards <= 7 & pass_location == "right" ~ "pass_short_right",
+          play_type == "pass" & air_yards > 7 & air_yards <= 20 & pass_location == "left" ~ "pass_medium_left",
+          play_type == "pass" & air_yards > 7 & air_yards <= 20 & pass_location == "middle" ~ "pass_medium_middle",
+          play_type == "pass" & air_yards > 7 & air_yards <= 20 & pass_location == "right" ~ "pass_medium_right",
+          play_type == "pass" & air_yards > 20 & pass_location == "left" ~ "pass_deep_left",
+          play_type == "pass" & air_yards > 20 & pass_location == "middle" ~ "pass_deep_middle",
+          play_type == "pass" & air_yards > 20 & pass_location == "right" ~ "pass_deep_right",
+          
+          play_type == "run" & run_location == "left" & run_gap == "end" ~ "run_left_d",
+          play_type == "run" & run_location == "left" & run_gap == "tackle" ~ "run_left_c",
+          play_type == "run" & run_location == "left" & run_gap == "guard" ~ "run_left_b",
+          play_type == "run" & run_location == "right" & run_gap == "end" ~ "run_right_d",
+          play_type == "run" & run_location == "right" & run_gap == "tackle" ~ "run_right_c",
+          play_type == "run" & run_location == "right" & run_gap == "guard" ~ "run_right_b",
+          play_type == "run" & run_location == "middle" ~ "run_a",
+          T ~ NA_character_
+        )
+      category[!is.na(category)]
+    }),
+    variation = std_entropy(unlist(play_category)),
+    score_diff = first(score_differential),
+    one_possession = as.integer(abs(first(score_differential)) <= 8),
+    short_time = as.integer(first(half_seconds_remaining) <= 300),
+    clutch = one_possession * short_time,
+    start_field_position = first(yardline_100), #yardline is distance from opponent endzoe. So 80 is own 20.
+    temp = first(temp),
+    wind = first(wind),
+    bad_weather = as.integer(
+      (!is.na(first(wind)) & first(wind) >= 20) | (!is.na(first(temp)) & first(temp) <= 32)
+    ),
+    passer_id = first(na.omit(passer_player_id)),
+    passer_player = first(na.omit(passer_player_name)),
+    .groups = "drop"
+  ) %>%
+  filter(nplays >= 2) %>% #one play drives can't have intra-drive variation
+  dplyr::select(-play_category)
+
+drives <- drives %>%
+  left_join(qbz, by = c("season", "passer_id" = "passer_player_id")) %>%
+  left_join(rbz, by = c("season", "posteam")) %>%
+  left_join(defz, by = c("season", "defteam")) %>%
+  left_join(wrz , by = c("season", "posteam")) %>%
+  left_join(blocking_grades, by = c("season", "posteam" = "team")) %>%
+  mutate(
+    team_season = paste(posteam, season, sep = "_"),
+    season = factor(season)
+  )
+
+pct_pass_only <- sum(drives$nrun == 0) / nrow(drives)
+pct_rush_only <- sum(drives$npass == 0) / nrow(drives)
+pct_mixed <- sum(drives$npass > 0 & drives$nrun > 0)/nrow(drives)
+pct_short_drives <- mean(drives$nplays <= 4)
+```
+
+# Source
+
+Conclusions from this study are drawn from a drive-level dataframe constructed of Pro Football Focus and select variables from nflfastR^[Carl S, Baldwin B(2026). *nflfastR: Functions to Efficiently Access NFL Play by Play Data*. R package version 5.2.0.9012, https://nflfastr.com/] API, an open-source R package that provides in-depth play-by-play descriptions. PFF provides metrics fro a team's pass- and run-blocking ability. From these sources, drive-level descriptions for `r nrow(drives)` multi-play drives from the 2015 to 2025 season, excluding the 2020 season, were constructed (ten seasons total).
+
+Drives were altered to remove kneel-downs and spikes. These are abnormal, situational plays that were deemed not to contribute to a team's actual variation in playcalling. As a result, drives in which the only plays were consecutive kneel-downs to end the game were removed entirely. Additionally, one-play drives were removed. While they contribute to game-level variation, at the drive level, they present data validity issues and are therefore omitted as teams achieve perfect variation improperly.
+
+The 2020 season was removed due to abnormalities introduced by the coronavirus pandemic that bear directly on the constructs this study relies on, rather than as a blanket precaution against an unusual year. In the 2020-21 season, 56.5% of games were played with no fans in attendance. The remaining 43.5% saw limited attendance well below normal capacity. As a result, home-field advantage was practically eliminated. In years preceding the pandemic season, the home team won roughly 57% of its games. During the 2020-21 season, the home-away split crashed down to near 50/50, and the typical three-point home scoring margin nearly disappeared.^[Szabó, A., & Perez Ruiz, F. (2021). *Does home advantage without crowd exist in American football?*] Because crowd noise is the primary obstacle to a team's communication, its near-total absence plausibly altered how easily a defense could pick up on pre-snap cues and in-drive tendencies, the exact channel through which within-drive play calling predictability is hypothesized to affect efficiency in this study. Roster composition also took a hit during this season. The league saw 66 players (18.8% of league starters) opt out of playing the season entirely. Offensive and defensive linemen made up half of that total. As this study relies on blocking controls, the removal of this abnormality stabilizes the assumption that teams are utilizing their best available players to make impact plays.
+
+\newpage
+
+# Model Specification
+
+## Expected Points Added (EPA)
+
+Expected Points Added (EPA) is the outcome variable throughout this study, a metric used to gauge how well a team is performing relative to expectation on a given play. A positive EPA means a team's plays are outperforming expectation. This study uses EPA per play within a drive as the drive's measure of success, rather than a cumulative total. This way, longer and shorter drives are placed on a comparable footing, though drive length is compensated for in modeling.
+
+
+```{r eda-density-early, fig.cap = "Distribution of EPA per play across all drives", fig.height = 4.5}
+ggplot(drives, aes(x = epa_per_play)) +
+  geom_density(fill = "#c0392b", alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "Distribution of EPA per Play", x = "EPA per play", y = "Density")
+
+```
+
+EPA per play experiences apparent trimodality. The largest mode is the true mode, league-average drive success. The high mode (~ 0.3) corresponds to pass-heavy drives, with the low mode (~ -0.4) corresponding to rush-heavy drives. EPA favors passing plays. The translation into a pass-heavy league means most rush plays yield an opportunity cost of not passing, which is realized in the EPA framework. So rushing plays aren't bad for offensive gameplay, merely less beneficial than a pass play in an expected situation, on average.
+
+\newpage
+
+## Variation
+
+Each play within a drive is sorted into one of sixteen categories: passes are classified by depth (a "medium" pass has air yards in the range (7, 20]; anything shorter is "short", anything longer is "deep") and by field third (left, middle, right); runs are classified by direction and gap. Variation is the standardized entropy of the play categories called across a drive, ranging from 0 (every play falls into the same bucket) to 1 (play types as evenly spread as the drive's length allows). Unlike an approach that separates rushing variation, passing variation, and pass/run mix into three distinct metrics, this study uses a single unified variation score across all play types, since the sixteen categories already span both facets of play calling within one measure.
+
+A squared variation term is also included in the model, motivated by an anticipation of diminishing, or even reversing, returns to variation past some threshold, rather than assuming the benefit of unpredictability climbs without a limit.
+
+A structural note: `r scales::percent(pct_short_drives, accuracy = 0.1)` of drives run four or fewer plays, three-and-outs being the largest contributor. Short drives mechanically have less room to display variety regardless of strategic intent, which is why drive length is included as a control variable below rather than left to confound with variation directly.
+
+## Drive Composition
+
+The Drive Composition vector accounts for the basic shape of the drive.
+
+- **Pass Rate**: the share of plays in the drive that were passes.
+- **Drive Length** and its square: controls for the number of plays directly, since both very short and very long drives could plausibly behave differently at either extreme. Its square is included to encapsulate diminishing or increasing returns.
+
+## Game Script
+
+The Game Script vector consists of variables describing the situation a drive began in.
+
+- **One Possession**: a dummy variable satisfied when the absolute score differential is eight points or fewer at the start of the drive (i.e., either team is within one score).
+- **Short Time**: a dummy variable satisfied when the drive begins with five minutes or less remaining in the half.
+- **Clutch Time**: the product of the above, intended to flag high-pressure situations specifically.
+- **Starting Field Position**: distance from the opponent's end zone at the start of the drive.
+
+## Talent
+
+The Talent vector contains six variables transformed into z-scores computed within each season individually, so that a given player or unit is compared only to its own year's league rather than across a decade of rule and scheme changes.
+
+- **Quarterback Talent Z-Score (QBZ)**: each player's average EPA per play that season, assigned to a drive based on whichever passer started the drive's first play.
+- **Rushing Talent Z-Score (RBZ)**: each team's average rushing EPA per play that season, taken as a runningback room to account for substitutions/injuries.
+- **Receiving Corps Talent Z-Score (WRZ)**: a targets-weighted average of each team's receivers' EPA per target, which keeps a single star receiver from making a thin receiving corps look better than a more evenly distributed one. 
+- **Run Blocking Grade (RBLK)** and **Pass Blocking Grade (PBLK)**: PFF blocking grades, standardized in the same z-score framework as the other variables.
+- **Opposing Defensive Talent Z-Score (DFZ)**: the opposing defense's average EPA allowed per play. *Note: this variable is an inverted z-score for interpretability such that higher values indicate better defenses*.
+
+## Weather
+
+**Bad Weather**: a binary flag satisfied when either extreme temperature, winds, or precipitation are present at the start of the drive.
+
+## Interactions
+
+Variation is interacted with every variable outside of `bad_weather` and `pblk_grade`. They were omitted for better model fit. Pass block grade was omitted on the logic that run blocking will directly impact scheme and variation (better players get the ball run toward them more), which isn't the case for passing. Good pass blocking affects "whether" the pass is completed, not necessarily "where".
+
+```{r}
+library(kableExtra)
+tibble(
+  Category = c("Mixed", "Pass-only", "Rush-only"),
+  `% of Drives` = scales::percent(c(pct_mixed, pct_pass_only, pct_rush_only), accuracy = 0.1)
+) %>%
+  knitr::kable(caption = "Drive composition across the sample") %>%
+  kable_styling()
+```
+
+Note that mixed drives make up the large majority of the sample; pass- and rush-only drives are comparatively rare and typically short. Because of this, the model below is fit on the fully pooled sample rather than as separate rush/pass/mixed models, with pass rate itself entered as a control, allowing the model to speak to variation's effect across the full spectrum of drive types at once, rather than requiring the reader to reconcile three separate sets of coefficients.
+
+\newpage
+
+```{r OLS, dependson="drives-table"}
+library(lme4)
+
+scaled_drives <- drives %>%
+  mutate(
+    variation = variation - mean(variation, na.rm = T),
+    pass_rate = scale(pass_rate)[, 1],
+    score_diff = scale(score_diff)[, 1],
+    start_field_pos = scale(start_field_position)[, 1],
+    temp = scale(temp)[, 1],
+    wind = scale(wind)[, 1],
+    season = factor(season)
+  ) %>%
+  dplyr::select(-start_field_position)
+
+
+m1 <- lm(
+  epa_per_play ~
+    variation + I(variation^2) + pass_rate + nplays + I(nplays^2) +
+    one_possession + short_time + start_field_pos +
+    qbz + rbz + wrz + defz + rblk_grade + pblk_grade +
+    bad_weather  + variation:one_possession + 
+    variation:short_time + variation:qbz + 
+    variation:rbz + variation:wrz + variation:defz +
+    variation:rblk_grade +
+    season,
+  data = scaled_drives
+  )
+```
+
+```{r model-diagnostics-hidden}
+library(sandwich); library(lmtest); library(car)
+bp <- bptest(m1)
+dw <- dwtest(m1)
+vif_tbl <- tibble(term = names(vif(m1)), VIF = round(vif(m1), 2))
+```
+
+Standard diagnostic checks were run prior to interpreting the model: residual plots and a Breusch-Pagan test (BP = `r round(bp$statistic, 1)`, p `r ifelse(bp$p.value < 0.001, "< 0.001", paste("=", round(bp$p.value, 3)))`) indicate heteroskedasticity, so robust (HC3) standard errors are reported for all inference below rather than default OLS standard errors. Variance inflation factors are all comfortably low, indicating no multicollinearity concern despite the number of interaction terms in the model.
+
+```{r robust-se}
+robust_se <- coeftest(m1, vcov = vcovHC(m1, type = "HC3"))
+```
+
+# Model Validation
+
+Two checks were run to confirm the model result is not an artifact of overfitting or of team-quality confounding. 
+
+**Out-of-sample-fit**. The model was refit 50 times on resampled subsets of the data (50-fold cross-validation) using the identical specification.
+
+```{r}
+library(caret)
+set.seed(42)
+cv <- trainControl(method = "cv", number = 50)
+m1_cv <- train(
+  epa_per_play ~
+    variation + I(variation^2) + pass_rate + nplays + I(nplays^2) +
+    one_possession + short_time + start_field_pos +
+    qbz + rbz + wrz + defz + rblk_grade + pblk_grade +
+    bad_weather  + variation:one_possession + 
+    variation:short_time + variation:qbz + 
+    variation:rbz + variation:wrz + variation:defz +
+    variation:rblk_grade +
+    season,
+  data = na.omit(scaled_drives),
+  method = "lm",
+  trControl = cv
+)
+
+in_sample_r2 <- summary(m1)$r.squared
+out_sample_rmse <- m1_cv$results$RMSE
+out_sample_r2 <- m1_cv$results$Rsquared
+resid_se <- summary(m1)$sigma
+```
+
+Out-of-sample-RMSE (`r round(out_sample_rmse, 3)`) is close to the model's in-sample residual standard error (`r round(resid_se, 3)`), and out-of-sample r-squared (`r round(out_sample_r2, 3)`) is close to in-sample r-squared (`r round(in_sample_r2, 3)`). Both are consistent with a model that generalizes rather than one that has simply memorized noise in its training sample.
+
+**Team-quality confounding**. A natural objection to any variation result is that teams with better talent might simply call more varied plays *and* be more efficient for unrelated reasons. To test this directly, `variation` was shuffled within each team-season 5,000 times, preserving each team's overall talent level and its overall tendency toward diversity, but destroying the specific link between a given drive's variation and its outcome.
+
+```{r permutation-test, cache = TRUE, dependson="OLS"}
+nperm <- 5000
+model_data <- na.omit(scaled_drives)
+observed_coef <- coef(m1)["I(variation^2)"]
+perm_coefs <- numeric(nperm)
+
+set.seed(525)
+for (i in 1:nperm){
+  permuted_data <- model_data %>%
+    group_by(team_season) %>%
+    mutate(variation = sample(variation)) %>%
+    ungroup()
+  
+  perm_fit <- lm(
+    epa_per_play ~
+      variation + I(variation^2) + pass_rate + nplays + I(nplays^2) +
+      one_possession + short_time + start_field_pos +
+      qbz + rbz + wrz + defz + rblk_grade + pblk_grade +
+      bad_weather  + variation:one_possession + 
+      variation:short_time + variation:qbz + 
+      variation:rbz + variation:wrz + variation:defz +
+      variation:rblk_grade +
+      season,
+    data = permuted_data
+  )
+  
+  perm_coefs[i] <- coef(perm_fit)["I(variation^2)"]
+}
+
+p_value <- mean(abs(perm_coefs) >= abs(observed_coef))
+n_exceeding <- sum(abs(perm_coefs) >= abs(observed_coef))
+```
+
+```{r permutation-plot, fig.cap = "Distribution of the variation coefficient under 5,000 random shuffles, vs. the observed value"}
+ggplot(data.frame(perm_coefs = perm_coefs), aes(x = perm_coefs)) +
+  geom_histogram(bins = 60, fill = "red", alpha = 0.7) +
+  geom_vline(xintercept = observed_coef, color = "#c0392b") +
+  theme_minimal() +
+  labs(
+    title = "Permutation Test: Squared Variation Coefficient",
+    x = "Coefficient on Variation (shuffled data)",
+    y = "Count"
+  )
+```
+
+Of `r nperm` shuffles, `r n_exceeding` produced a squared-variation coefficient as extreme as the one actually observed (p `r ifelse(p_value < 0.001, "< 0.001", paste("=", round(p_value, 4)))`). When the real link between a drive's variation and its efficiency is deliberately destroyed, the curvature effect collapses toward zero, consistent with a genuine relationship rather than a team-quality artifact.
+
+\newpage
+
+# Results: Full Model
+
+```{r}
+library(modelsummary)
+
+variation_coef <- coef(m1)["variation"]
+
+modelsummary(
+  list("Full Model" = m1),
+  vcov = vcovHC(m1, type = "HC3"),
+  stars = c('*' = .05, '**' = .01, '***' = .001),
+  estimate = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  align = "ll",
+  coef_omit = "season",
+  coef_rename = c(
+    "variation" = "Variation",
+    "I(variation^2)" = "Squared Variation",
+    "pass_rate" = "Pass Rate",
+    "nplays" = "Drive Length",
+    "I(nplays^2)" = "Squared Drive Length",
+    "one_possession" = "One Possession (OP)",
+    "short_time" = "Short Time (ST)",
+    "start_field_pos" = "Starting Field Position",
+    "qbz" = "Quarterback Talent (QBZ)",
+    "rbz" = "Rushing Talent (RBZ)",
+    "wrz" = "Receiving Talent (WRZ)",
+    "defz" = "Defensive Talent (DFZ)",
+    "rblk_grade" = "Run Blocking (RBLK)",
+    "pblk_grade" = "Pass Blocking (PBLK)",
+    "bad_weather" = "Bad Weather",
+    "variation:one_possession" = "Variation x OP",
+    "variation:short_time" = "Variation x ST",
+    "variation:qbz" = "Variation x QBZ",
+    "variation:rbz" = "Variation x RBZ",
+    "variation:wrz" = "Variation x WRZ",
+    "variation:defz" = "Variation x DFZ",
+    "variation:rblk_grade" = "Variation x RBLK"
+  ),
+  gof_omit = "IC|Log|Adj|Errors",
+  output = "kableExtra",
+  title = "Full Model Results (Robust HC3 Standard Errors)"
+) %>%
+  add_footnote("Season fixed effects included but omitted from the table for brevity.", notation = "none") %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+The linear term on variation is not statistically significant (`r round(coef(m1)["variation"], 3)`, SE `r round(coeftest(m1, vcov = vcovHC(m1, type = "HC3"))["variation", 2], 3)`), while the squared term is significant and negative (`r round(coef(m1)["I(variation^2)"], 3)`, p < .001). Because the squared term dominates the shape of the curve, the relationship between variation and EPA per play is concave: EPA/play rises with variation up to a point, then declines past it. Since variation is mean-centered and the linear term does not differ significantly from zero, the peak of this curve sits close to the average level of variation already observed in the sample. The typical NFL drive is already calling plays near the point of maximum return from unpredictability, rather than clearly under- or over-diversified. This is a different, and better-supported, claim than "more variation is always better": there is such a thing as too much or too little variation, and the payoff peaks in between. Perhaps, with too few variation, a team is providing predictable playcalling, making it easy for defensive coordinators to halt offensive progress. Too much variation could be evident of not sticking to what works. Perhaps an offense in a drive is focusing on players other than their offensive star, decreasing their ability to realize offensive success.
+
+\newpage
+
+Two of the variation interactions stand out. Variation interacted with Short Time is negative and significant (`r round(coef(m1)["variation:short_time"], 3)`, p < .001), indicating that late in the half, the marginal benefit of additional variation is smaller than earlier in the game, consistent with a coordinator having less room to experiment once the clock becomes a binding constraint. Also likely, winning teams with less time on the clock are more likely to run the ball to drain out what remains of the game. Variation interacted with Run Blocking Grade is positive and marginally significant (`r round(coef(m1)["variation:rblk_grade"], 3)`, p < .05), suggesting teams with stronger run blocking see a somewhat larger marginal benefit from varying their calls, plausibly because good blocking gives an offense more designs it can credibly threaten to run. The remaining variation interactions are not statistically distinguishable from zero, indicating the shape of the variation-EPA relationship does not meaningfully depend on the talent around it.
+
+Among the control variables, drive composition behaves as expected: a higher pass rate is associated with modestly lower EPA per play (`r round(coef(m1)["pass_rate"], 3)`), while additional plays initially raise EPA per plays (`r round(coef(m1)["nplays"], 3)`) before the effect tapers off (`r round(coef(m1)["I(nplays^2)"], 3)`), consistent with longer drives capturing sustained success up to a point. Of the Game Script vector, Short Time is positive and significant (`r round(coef(m1)["short_time"], 3)`) and Starting Field Position is negative and significant (`r round(coef(m1)["start_field_pos"], 3)`; better field position associated with higher EPA/play, as expected), while One Possession alone does not reach significance. All talent measures point the expected direction. Offensive weapon talents are correlated with positive EPA/play:
+
+- Quarterback: `r round(coef(m1)["qbz"], 3)`, p < .001
+
+- Rushing: `r round(coef(m1)["rbz"], 3)`, p < .001
+
+- Receiving: `r round(coef(m1)["wrz"], 3)`, p < .001
+
+Also logical, stronger defenses are negatively associated with offensive success (`r round(coef(m1)["defz"], 3)`, p < .001). 
+
+Run and pass blocking grades are not significant as main effects, and bad weather is associated with modestly lower EPA/Play (`r round(coef(m1)["bad_weather"], 3)`, p < .05).
+
+\newpage
+
+# Results: Subgroup Comparisons
+
+Two natural follow-up questions: does the variation effect look different for pass-heavy versus run-heavy drives, and has it changed as the league has evolved over the past decade? Variation coefficients for each subgroup along with its robust standard error and p-value are presented.
+
+```{r subgroup-models}
+pass_heavy <- model_data %>% filter(pass_rate > 0.70, nplays >= 3)
+run_heavy <- model_data %>% filter(pass_rate < 0.30, nplays >= 3)
+
+
+m_pass <- lm(
+  epa_per_play ~ variation + I(variation^2) + pass_rate + nplays + I(nplays^2) +
+    one_possession + short_time + start_field_pos +
+    qbz + rbz + wrz + defz + rblk_grade + pblk_grade +
+    bad_weather + variation:one_possession +
+    variation:short_time + variation:qbz +
+    variation:rbz + variation:wrz + variation:defz +
+    variation:rblk_grade + season,
+  data = pass_heavy
+)
+
+m_rush <- lm(
+  epa_per_play ~ variation + I(variation^2) + pass_rate + nplays + I(nplays^2) +
+    one_possession + short_time + start_field_pos +
+    qbz + rbz + wrz + defz + rblk_grade + pblk_grade +
+    bad_weather + variation:one_possession +
+    variation:short_time + variation:qbz +
+    variation:rbz + variation:wrz + variation:defz +
+    variation:rblk_grade + season,
+  data = run_heavy
+)
+
+early <- model_data %>% filter(season %in% c(2015:2019))
+late <- model_data %>% filter(season %in% c(2021:2025))
+
+m_early <- lm(
+  epa_per_play ~ variation + I(variation^2) + pass_rate + nplays + I(nplays^2) +
+    one_possession + short_time + start_field_pos +
+    qbz + rbz + wrz + defz + rblk_grade + pblk_grade +
+    bad_weather + variation:one_possession +
+    variation:short_time + variation:qbz +
+    variation:rbz + variation:wrz + variation:defz +
+    variation:rblk_grade + season,
+  data = early
+)
+
+m_late <- lm(
+  epa_per_play ~ variation + I(variation^2) + pass_rate + nplays + I(nplays^2) +
+    one_possession + short_time + start_field_pos +
+    qbz + rbz + wrz + defz + rblk_grade + pblk_grade +
+    bad_weather + variation:one_possession +
+    variation:short_time + variation:qbz +
+    variation:rbz + variation:wrz + variation:defz +
+    variation:rblk_grade + season,
+  data = late
+)
+
+pass_ct <- coeftest(m_pass, vcov = vcovHC(m_pass, type = "HC3"))
+rush_ct <- coeftest(m_rush, vcov = vcovHC(m_rush, type = "HC3"))
+early_ct <- coeftest(m_early, vcov = vcovHC(m_early, type = "HC3"))
+late_ct <- coeftest(m_late, vcov = vcovHC(m_late, type = "HC3"))
+
+sig_stars <- function(p){
+  case_when(
+    p < .001 ~ "***",
+    p < .01 ~ "**",
+    p < .05 ~ "*",
+    T ~ ""
+  )
+}
+
+fmt_cell <- function(ct, term){
+  sprintf("%.3f (%.3f)%s", ct[term, "Estimate"], ct[term, "Std. Error"],
+          sig_stars(ct[term, "Pr(>|t|)"]))
+}
+
+subgroup_summary <- data.frame(
+  Model = c("Pass-heavy drives (>70% pass)", "Run-heavy drives (<30% pass)",
+            "Early era (2015-2019)", "Late era (2021-2025)"),
+  N = c(nrow(pass_heavy), nrow(run_heavy), nrow(early), nrow(late)),
+  `Variation` = c(fmt_cell(pass_ct, "variation"), fmt_cell(rush_ct, "variation"),
+                  fmt_cell(early_ct, "variation"), fmt_cell(late_ct, "variation")),
+  `Variation Squared` = c(fmt_cell(pass_ct, "I(variation^2)"), fmt_cell(rush_ct, "I(variation^2)"),
+                           fmt_cell(early_ct, "I(variation^2)"), fmt_cell(late_ct, "I(variation^2)"))
+)
+
+subgroup_summary %>%
+  kable(
+    caption = "Variation and Variation² Across Subgroups",
+    align = c("l", "r", "r", "r")
+  ) %>%
+  kable_styling() %>%
+  footnote(general = "*p<.05, **p<.01, ***p<.001. Estimate (Robust SE) shown for each term.",
+           general_title = "")
+```
+
+Evident in the table, the concave relationship is not an artifact of the pooled sample: the squared variation term is negative and significant across all four subgroupings, meaning the "diminishing and eventually reversing returns" shape holds regardless of how pass-heavy a drive is or which half of the sample it comes from. What differs across subgroups is the *linear* term, and with it, where the peak of that curve actually sits. For pass-heavy drives the linear term is negative and significant (`r round(pass_ct["variation", "Estimate"], 3)`, p `r ifelse(pass_ct["variation", "Pr(>|t|)"] < .001, "< .001", paste("=", round(pass_ct["variation", "Pr(>|t|)"], 3)))`); for run-heavy drives, it is smaller in magnitude and not significant (`r round(rush_ct["variation", "Estimate"], 3)`). 
+
+Combined with a comparable quadratic term in both groups, this indicates that pass-heavy drives are, on average, further past their point of maximum return from variation than run-heavy drives are. Passing offenses appear more prone to spreading their play design thinner than is actually optimal, while run-heavy drives sit closer to their curve's peak already. This is consistent with a simple mechanical story: a run game has fewer available gaps and directions to vary in the first place, so there is less room for a rushing attack to over-diversify relative to a passing attack, which has considerably more combinations of depth and location to draw on.
+
+The era comparison tells a complementary story. The linear term shrinks from significant and negative in the early era (`r round(early_ct["variation", "Estimate"], 3)`, p `r ifelse(early_ct["variation", "Pr(>|t|)"] < .001, "< .001", paste("=", round(early_ct["variation", "Pr(>|t|)"], 3)))`) to statistically indistinguishable from zero in the late era (`r round(late_ct["variation", "Estimate"], 3)`), while the quadratic term stays significant and of similar magnitude in both periods (`r round(early_ct["I(variation^2)", "Estimate"], 3)` versus `r round(late_ct["I(variation^2)", "Estimate"], 3)`). Taken together with the sign pattern above, this suggests the average NFL drive's level of variation has moved measurably closer to the curve's peak over the course of the last decade. In the earlier seasons, the typical drive appears to have already been past the point of maximum benefit from variation, whereas by the later seasons that gap has largely closed. That reads as a specific, testable version of the broader "the league has become more analytically sophisticated in its play-calling" narrative: offenses seem to have converged toward the amount of unpredictability that actually pays off, rather than simply calling more varied plays across the board.
+
+Because the linear term is not statistically significant in either the run-heavy or late-era subgroups, the exact location of the peak in those cases carries real uncertainty. The point estimate can still be calculated from the two coefficients, but it should be read as suggestive rather than precisely pinned down when the linear term itself isn't distinguishable from zero.
+
+\newpage
+
+# Visual Summary
+
+Three figures below consolidate the findings from the two Results sections into a form that shows the shape of the effect directly. As the mean-centered standardized entropy of play selection, the actual numbers aren't of use to interpret, but the general shape of the curve.
+
+```{r marginal-effect-full, fig.cap = "Predicted EPA per play across the observed range of variation, holding all other variables at their reference level"}
+
+variation_range <- seq(min(scaled_drives$variation, na.rm = T), max(scaled_drives$variation, na.rm = T), length.out = 100)
+
+pred_grid <- data.frame(
+  variation = variation_range,
+  pass_rate = 0, nplays = mean(scaled_drives$nplays, na.rm = T),
+  one_possession = mean(scaled_drives$one_possession, na.rm = T),
+  short_time = mean(scaled_drives$short_time, na.rm = T),
+  start_field_pos = 0,
+  qbz = 0, rbz = 0, wrz = 0, defz = 0, rblk_grade = 0, pblk_grade = 0,
+  bad_weather = mean(scaled_drives$bad_weather, na.rm = T),
+  season = "2025"
+)
+
+preds <- predict(m1, newdata = pred_grid, interval = "confidence")
+pred_grid <- cbind(pred_grid, preds)
+
+ggplot(pred_grid, aes(x = variation, y = fit)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), fill = "#c0392b", alpha = 0.2) +
+  geom_line(color = "#c0392b", linewidth = 1) +
+  theme_minimal() +
+  labs(title = "Predicted EPA/Play vs. Variation", x = "Variation (centered)", y = "Predicted EPA per play")
+```
+
+The full-model result made visual: EPA per play climbs as variation increases, peaks, and bends back down. The concave shape reported in the Full Model section as a negative, significant squared term alongside a linear term that was not statistically distinguishable from zero. 
+
+```{r marginal-effect-subgroup-passrun, fig.cap="Predicted EPA per play vs. variation, pass-heavy and run-heavy drives"}
+pred_grid_pr <- rbind(
+  transform(pred_grid[, !(names(pred_grid) %in% c("fit","lwr","upr"))], group = "Pass-heavy"),
+  transform(pred_grid[, !(names(pred_grid) %in% c("fit","lwr","upr"))], group = "Run-heavy")
+)
+
+pred_grid_pr$fit <- c(predict(m_pass, newdata = pred_grid), predict(m_rush, newdata = pred_grid))
+
+ggplot(pred_grid_pr, aes(x = variation, y = fit, color = group)) + 
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = c("Pass-heavy" = "#c0392b", "Run-heavy" = "grey40")) +
+  theme_minimal() +
+  labs(title = "Predicted EPA/Play vs. Variation, by Drive Type", x = "Variation (centered)", y = "Predicted EPA per play", color = NULL)
+```
+
+This visualizes the subgroup finding that pass-heavy drives peak earlier and declined more sharply than run-heavy drives, consistent with pass-heavy offenses having more ways to over-diversify than a run game does. Also noted in the introduction, passing plays are more favorable in the EPA framework than rushing plays, evident once again in the difference between the curves in the presented window. 
+
+```{r marginal-effect-subgroup-era, fig.cap="Predicted EPA per play vs. variation, early and late era"}
+make_pred_grid <- function(season_value){
+  data.frame(
+    variation = variation_range,
+    pass_rate = 0, nplays = mean(scaled_drives$nplays, na.rm = T),
+    one_possession = mean(scaled_drives$one_possession, na.rm = T),
+    short_time = mean(scaled_drives$short_time, na.rm = T),
+    start_field_pos = 0,
+    qbz = 0, rbz = 0, wrz = 0, defz = 0, rblk_grade = 0, pblk_grade = 0,
+    bad_weather = mean(scaled_drives$bad_weather, na.rm = T),
+    season = season_value
+  )
+}
+
+pred_grid_early <- make_pred_grid("2017")
+pred_grid_late  <- make_pred_grid("2023")
+
+pred_grid_era <- rbind(
+  transform(pred_grid_early, group = "2015-2019"),
+  transform(pred_grid_late, group = "2021-2025")
+)
+
+pred_grid_era$fit <- c(predict(m_early, newdata = pred_grid_early), predict(m_late, newdata = pred_grid_late))
+
+ggplot(pred_grid_era, aes(x = variation, y = fit, color = group)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(values = c("2015-2019" = "grey40", "2021-2025" = "#c0392b")) +
+  theme_minimal() +
+  labs(title = "Predicted EPA/Play vs. Variation, by Era", x = "Variation (centered)", y = "Predicted EPA per play", color = NULL)
+```
+
+The two era curves are nearly identical in shape, both rising steeply, flattening, and turning over at a similar location, direct visual confirmation of the subgroup table's finding that the quadratic term is significant and similar in magnitude in both periods (`r round(early_ct["I(variation^2)", "Estimate"], 3)` early era vs. `r round(late_ct["I(variation^2)", "Estimate"], 3)` late era). The late-era curve (red) sits consistently below the early-era curve (gray) through most of the variation range, converging with it only as both approach their peak, consistent with the early era's larger, significant linear term (`r round(early_ct["variation", "Estimate"], 3)`) versus the late era's smaller, non-significant one (`r round(late_ct["variation", "Estimate"], 3)`). Solving each curve's own coefficients for where it peaks does place the early-era maximum at a somewhat more negative point on the variation axis than the late-era maximum, but the two curves are close enough in this range that the difference is subtle to the eye rather than a dramatic separation, the more reliable takeaway from this figure is the shared concave shape itself, not a sharply distinct peak location between eras. 
+
+Note that the x-axis here and across all graphs spans mostly negative values by construction: variation is bounded between 0 and 1 before centering, and because the sample average sits close to the upper end of that range, the centered variable has very little room to be positive. Most of the meaningful variation in how drives behave happens on the negative side of this axis.
+
+\newpage
+
+# Conclusive Takeaways
+
+When trying to design successful plays in a drive, variation matters, but not in the "more is always better" sense the introduction set out to test. Every subgroup examined shows the same concave shape: EPA per play rises with variation up to a point and declines past it. The location of that peak, not the existence of the relationship, is what differs across play calling contexts. Pass-heavy drives and earlier seasons show a peak that has already been passed on average, while run-heavy drives and more recent seasons sit closer to the point of maximum return. This is consistent with a league over the past decade that has moved toward the amount of unpredictability that actually pays off rather than simply increasing variation across the board.
+
+For a playcaller, the practical takeaway is not "vary more" but "there is a point past which additional variation stops helping and starts hurting," and that point appears to depend on how run-heavy the offense is and, to some extent, on the era being played in. Two other results deserve real weight alongside this: the interaction between variation and short time, which indicates the benefit of variation shrinks under late-half time pressure, and the general insignificance of variation's dependence on the surrounding talent -- meaning this is not primarily a story about needing a great quarterback or offensive line to benefit from unpredictable play-calling.
+
+Interpretation should lean most heavily on the full pooled model and the era/pass-rate subgroup comparisons together, rather than any single in isolation: the full model establishes that the concave relationship exists and survives a randomization test built to rule out team-quality confounding, while the subgroup comparisons show that the *location* of the curve's peak is not fixed, but shifts in ways that map onto real, sensible football differences in drive type and era.
+
+\newpage
+
+# Limitations
+
+- **Repeated observations** Multiple drives are drawn from the same game and the same team-season, so observations are not fully independent. Robust (HC3) standard errors correct for unequal error variance but not for this clustering; standard errors clustered by team-season would be a stricter alternative to what is reported throughout this study.
+- **Drive length and variation are mechanically linked** Longer drives simply have more opportunities to display varied play types. The model controls for this directly (drive length and its square), but part of the story here is plausibly "successful drives last longer, and lasting longer allows for more variety" rather than pure play-calling philosophy alone. 
+- **Variation's peak is not stated in interpretable units** Because standardized entropy is normalized by the number of play categories actually observed in a given drive rather than a fixed constant, a single raw value of Variation does not correspond to one fixed "effective number of play types" across drives of different lengths. The curve's shape and relative peak location are interpretable; a specific numeric value of Variation is not.
+- **Peak location is imprecise where the linear term is insignificant** In the run-heavy and late-era subgroups specifically, the linear Variation term does not reach statistical significance, meaning the exact location of that subgroup's curve peak carries real uncertainty even though the concave shape itself is well-supported.
+- **Receiving and rushing talent are room level averages, not player specific** This is a deliberate choice to absorb in-season injuries and substitutions without needing play-by-play injury data, but it also means a team's talent score doesn't distinguish between, for example, a lead back missing several games and a full committee approach. Both could theoretically produce similar aggregate rushing EPA despite representing different offensive situations.
