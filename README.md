@@ -2,7 +2,7 @@
 
 A drive-level analysis of play variation and EPA per play using nflfastR and PFF data, with a concave (diminishing-returns) result validated via permutation testing.
 
-**[`Read the full write-up`]**
+**[`Read the full write-up`](PlayVariation.Rmd)**
 
 ## Summary
 
